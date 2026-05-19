@@ -35,7 +35,14 @@ std::unique_ptr<NfcManager> nfcManager;
 
 static dns_server_handle_t dns_server = NULL;
 
-bool pollHS = false;
+static constexpr uint32_t WIFI_AUTO_AP_GRACE_PERIOD_MS = 5UL * 60UL * 1000UL;
+
+volatile bool pollHS = false;
+volatile bool hasConnectedSinceBoot = false;
+volatile bool pendingConfigApFallback = false;
+volatile bool configApActive = false;
+volatile bool keepRetryingWiFiInConfigAp = false;
+volatile uint32_t firstWiFiDisconnectMs = 0;
 
 static void dhcp_set_captiveportal_url(void) {
     esp_netif_ip_info_t ip_info;
@@ -57,6 +64,10 @@ static void dhcp_set_captiveportal_url(void) {
 
 static void start_captive_portal(void)
 {
+    if (dns_server != NULL) {
+        return;
+    }
+
     dhcp_set_captiveportal_url();
 
     dns_server_config_t dns_config = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
@@ -64,22 +75,53 @@ static void start_captive_portal(void)
     ESP_LOGI("Main", "DNS server started for captive portal");
 }
 
+static void stop_captive_portal(void)
+{
+    if (dns_server == NULL) {
+        return;
+    }
+
+    stop_dns_server(dns_server);
+    dns_server = NULL;
+    ESP_LOGI("Main", "DNS server stopped");
+}
+
 std::function<void(int)> lambda = [](int status) {
+  if (status >= 1) {
+    hasConnectedSinceBoot = true;
+    pendingConfigApFallback = false;
+    firstWiFiDisconnectMs = 0;
+
+    if (configApActive && keepRetryingWiFiInConfigAp) {
+      ESP_LOGI("Main", "WiFi connected while configuration AP is active. Returning to normal STA mode.");
+      webServerManager->end();
+      stop_captive_portal();
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      configApActive = false;
+      keepRetryingWiFiInConfigAp = false;
+    }
+  }
+
   if (status == 1) {
     char identifier[18];
     sprintf(identifier, "%.2s%.2s%.2s%.2s%.2s%.2s", HAPClient::accessory.ID, HAPClient::accessory.ID + 3, HAPClient::accessory.ID + 6, HAPClient::accessory.ID + 9, HAPClient::accessory.ID + 12, HAPClient::accessory.ID + 15);
     mqttManager->begin(std::string(identifier));
     webServerManager->begin(); 
   } else if (status == 0){
-    pollHS = false;
+    configApActive = true;
     mqttManager->end();
     webServerManager->end();
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("HomeKey-ESP32", "homekey123", 11, false, 2, false, WIFI_AUTH_WPA2_WPA3_PSK, WIFI_CIPHER_TYPE_AES_CMAC128); 
     start_captive_portal();
     webServerManager->begin();
-    while(true){
-      vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (!keepRetryingWiFiInConfigAp) {
+      pollHS = false;
+      while(true){
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
     }
   }
 };
@@ -179,12 +221,24 @@ void setup() {
   homekitLock->begin();
   lockManager->begin();
   WiFi.onEvent([](arduino_event_id_t event){
-    static uint8_t count = 0;
-    if(count >= 6){
-      homeSpan.processSerialCommand("A");
-      count = 0;
-    } else {
-      count++;
+    (void)event;
+
+    if (configApActive || hasConnectedSinceBoot) {
+      return;
+    }
+
+    const uint32_t now = millis();
+    if (firstWiFiDisconnectMs == 0) {
+      firstWiFiDisconnectMs = now;
+      ESP_LOGW("Main", "WiFi disconnected before first network connection. HomeSpan will keep retrying for up to %lu seconds before configuration AP fallback.",
+               static_cast<unsigned long>(WIFI_AUTO_AP_GRACE_PERIOD_MS / 1000));
+      return;
+    }
+
+    if (!pendingConfigApFallback && now - firstWiFiDisconnectMs >= WIFI_AUTO_AP_GRACE_PERIOD_MS) {
+      pendingConfigApFallback = true;
+      ESP_LOGW("Main", "WiFi has been unavailable for %lu seconds since boot. Scheduling configuration AP fallback.",
+               static_cast<unsigned long>((now - firstWiFiDisconnectMs) / 1000));
     }
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   pollHS = true;
@@ -198,6 +252,13 @@ void setup() {
  */
 
 void loop() {
+  if (pendingConfigApFallback && pollHS && !configApActive) {
+    pendingConfigApFallback = false;
+    keepRetryingWiFiInConfigAp = true;
+    homeSpan.processSerialCommand("A");
+    return;
+  }
+
   if(pollHS)
     homeSpan.poll();
   vTaskDelay(pdMS_TO_TICKS(50));
